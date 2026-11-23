@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Budget Tracker</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--muted:#6b7385;--line:#e3e6ec;--accent:#0f766e;--danger:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--text:#e8ebf1;--muted:#98a1b3;--line:#2a3140;--accent:#2dd4bf;--danger:#f97066}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:640px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.4rem;margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+input,select,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+input{flex:1;min-width:120px}
+button{cursor:pointer;background:var(--accent);color:#fff;border:0;font-weight:600}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button.del{background:transparent;color:var(--danger);padding:4px 8px;font-weight:400}
+.total{font-size:2rem;font-weight:700;color:var(--accent)}
+.muted{color:var(--muted);font-size:.9rem}
+.head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.item{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--line)}
+.item .d{flex:1;overflow-wrap:anywhere}
+.item .amt{font-weight:600;white-space:nowrap}
+details summary{cursor:pointer;font-weight:600}
+label{display:block;margin:10px 0 4px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>Budget Tracker</h1>
+
+<div class="card">
+  <div class="row">
+    <input id="desc" placeholder="Description (e.g. Groceries)" maxlength="100">
+    <input id="amt" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Amount">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <input id="date" type="date">
+    <button id="add">Add spending</button>
+  </div>
+  <p id="msg" class="muted" style="margin:8px 0 0"></p>
+</div>
+
+<div class="card">
+  <div class="head">
+    <div>
+      <div class="muted" id="totalLabel">Total spent</div>
+      <div class="total" id="total">0.00</div>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <select id="viewing" class="hidden" title="Whose spendings to view"></select>
+      <input id="month" type="month" style="flex:0 0 auto;min-width:0">
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="head" style="margin-bottom:8px">
+    <strong>Spendings</strong>
+    <div class="row">
+      <button class="ghost" id="refresh">Refresh</button>
+      <button class="ghost" id="export">Download for Excel</button>
+    </div>
+  </div>
+  <div id="list"></div>
+</div>
+
+<div class="card">
+  <details id="settings">
+    <summary>Google Sheet sync</summary>
+    <label for="person" class="muted">Your name. Your spendings go into the tab with this name.</label>
+    <input id="person" placeholder="e.g. Sarvesh" maxlength="30" style="width:100%">
+    <label for="sheet" class="muted">Web app URL from your Google Apps Script. Leave empty to keep data only on this device.</label>
+    <div class="row">
+      <input id="sheet" placeholder="https://script.google.com/macros/s/.../exec">
+      <button class="ghost" id="saveSheet">Save</button>
+    </div>
+    <div id="migrate" class="hidden" style="margin-top:12px">
+      <button class="ghost" id="upload"></button>
+    </div>
+  </details>
+</div>
+</main>
+
+<script>
+const CUR = 'Rs'; // change to $, €, etc.
+const KEY = 'budget_expenses', SKEY = 'budget_sheet_url', PKEY = 'budget_person';
+
+const $ = id => document.getElementById(id);
+const today = () => new Date().toISOString().slice(0, 10);
+const clean = s => String(s).replace(/[\[\]*?\/\\:]/g, '').trim();
+
+function read(k, fallback) {
+  try { const v = localStorage.getItem(k); return v === null ? fallback : JSON.parse(v); }
+  catch (e) { return fallback; }
+}
+function write(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+let sheetUrl = read(SKEY, '');
+let person = read(PKEY, '');
+let viewing = person;
+let users = [];
+let items = [];
+
+const fmt = n => CUR + ' ' + n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const say = t => { $('msg').textContent = t; };
+const sheetOn = () => !!(sheetUrl && person);
+const canEdit = () => !sheetOn() || viewing === person;
+const sheetGet = q => fetch(sheetUrl + (sheetUrl.includes('?') ? '&' : '?') + q).then(r => r.json());
+const sheetPost = o => fetch(sheetUrl, {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify(o)});
+
+function renderViewing() {
+  const sel = $('viewing');
+  sel.classList.toggle('hidden', !sheetOn());
+  if (!sheetOn()) return;
+  const names = Array.from(new Set([person].concat(users)));
+  sel.innerHTML = '';
+  names.forEach(n => {
+    const o = document.createElement('option');
+    o.value = n;
+    o.textContent = n === person ? n + ' (me)' : n;
+    sel.appendChild(o);
+  });
+  sel.value = viewing;
+}
+
+function render() {
+  const m = $('month').value;
+  const rows = items.filter(i => i.date.slice(0, 7) === m)
+                    .sort((a, b) => b.date.localeCompare(a.date) || String(b.id).localeCompare(String(a.id)));
+  $('totalLabel').textContent = sheetOn() ? 'Total spent by ' + viewing : 'Total spent';
+  $('total').textContent = fmt(rows.reduce((s, i) => s + i.amount, 0));
+  const list = $('list');
+  list.innerHTML = '';
+  if (!rows.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = 'No spendings for this month yet.';
+    list.appendChild(p);
+    return;
+  }
+  rows.forEach(i => {
+    const el = document.createElement('div');
+    el.className = 'item';
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = i.description;
+    const sub = document.createElement('div');
+    sub.className = 'muted';
+    sub.textContent = i.date;
+    d.appendChild(sub);
+    const a = document.createElement('div');
+    a.className = 'amt';
+    a.textContent = fmt(i.amount);
+    el.append(d, a);
+    if (canEdit()) {
+      const b = document.createElement('button');
+      b.className = 'del';
+      b.textContent = 'Delete';
+      b.onclick = () => remove(i);
+      el.appendChild(b);
+    }
+    list.appendChild(el);
+  });
+}
+
+async function refresh() {
+  const local = read(KEY, []);
+  $('migrate').classList.toggle('hidden', !(sheetOn() && local.length));
+  $('upload').textContent = 'Upload ' + local.length + ' entries saved on this device to my sheet tab';
+  if (!sheetOn()) { items = local; renderViewing(); render(); return; }
+  say('Loading from sheet…');
+  try {
+    const [u, r] = await Promise.all([sheetGet(''), sheetGet('user=' + encodeURIComponent(viewing))]);
+    users = u.users || [];
+    items = (r.rows || []).filter(x => x.date && x.amount >= 0);
+    say('');
+  } catch (e) {
+    say('Could not load from the sheet. Check the URL and that the web app access is set to "Anyone".');
+  }
+  renderViewing();
+  render();
+}
+
+async function remove(i) {
+  if (!confirm('Delete "' + i.description + '"?')) return;
+  if (sheetOn()) {
+    items = items.filter(x => x.id !== i.id);
+    render();
+    try { await sheetPost({action: 'delete', user: person, id: i.id}); } catch (e) { say('Delete failed.'); }
+    refresh();
+  } else {
+    items = items.filter(x => x.id !== i.id);
+    write(KEY, items);
+    render();
+  }
+}
+
+$('add').onclick = async () => {
+  const description = $('desc').value.trim();
+  const amount = parseFloat($('amt').value);
+  const date = $('date').value || today();
+  if (!description || !(amount > 0)) { say('Please enter a description and an amount above 0.'); return; }
+  if (sheetUrl && !person) { say('Open "Google Sheet sync" below and enter your name first.'); $('settings').open = true; return; }
+  const item = {id: String(Date.now()), date, description, amount};
+  $('desc').value = '';
+  $('amt').value = '';
+  $('month').value = date.slice(0, 7);
+  $('desc').focus();
+  if (sheetOn()) {
+    viewing = person;
+    items.push(item);
+    renderViewing();
+    render();
+    say('Saving…');
+    try { await sheetPost({...item, user: person}); say('Saved.'); } catch (e) { say('Could not reach the sheet.'); }
+    refresh();
+  } else {
+    items = read(KEY, []);
+    items.push(item);
+    write(KEY, items);
+    say('Added.');
+    render();
+  }
+};
+
+$('export').onclick = () => {
+  const esc = s => '"' + String(s).replace(/"/g, '""') + '"';
+  const lines = ['Date,Description,Amount'].concat(
+    items.slice().sort((a, b) => a.date.localeCompare(b.date))
+         .map(i => [i.date, esc(i.description), i.amount].join(','))
+  );
+  const blob = new Blob(['\ufeff' + lines.join('\n')], {type: 'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (sheetOn() ? viewing + '-' : '') + 'spendings.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+
+$('saveSheet').onclick = () => {
+  sheetUrl = $('sheet').value.trim();
+  person = clean($('person').value);
+  $('person').value = person;
+  write(SKEY, sheetUrl);
+  write(PKEY, person);
+  viewing = person;
+  if (sheetUrl && !person) say('Enter your name too, so your spendings go into your own tab.');
+  refresh();
+};
+
+$('upload').onclick = async () => {
+  const local = read(KEY, []);
+  say('Uploading…');
+  try {
+    for (const i of local) { await sheetPost({...i, id: String(i.id), user: person}); }
+    write(KEY, []);
+    say('Uploaded ' + local.length + ' entries.');
+  } catch (e) { say('Upload failed. Nothing was removed from this device.'); }
+  setTimeout(refresh, 1500);
+};
+
+$('viewing').onchange = () => { viewing = $('viewing').value; refresh(); };
+$('refresh').onclick = refresh;
+$('month').onchange = render;
+$('amt').addEventListener('keydown', e => { if (e.key === 'Enter') $('add').click(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && sheetOn()) refresh(); });
+
+$('date').value = today();
+$('month').value = today().slice(0, 7);
+$('sheet').value = sheetUrl;
+$('person').value = person;
+refresh();
+</script>
+</body>
+</html>
